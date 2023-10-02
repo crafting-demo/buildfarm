@@ -40,7 +40,7 @@ workspaces:
           git: https://github.com/crafting-demo/buildfarm
         manifest:
           overlays:
-          - inline: {}  # Mute the auto-convert manifest.
+          - file: .sandbox/setup.yaml
     port_forward_rules:
     - local: '8980'
       remote:
