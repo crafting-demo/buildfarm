@@ -38,6 +38,9 @@ workspaces:
       - path: buildfarm
         repo:
           git: https://github.com/crafting-demo/buildfarm
+        manifest:
+          overlays:
+          - inline: {}  # Mute the auto-convert manifest.
     port_forward_rules:
     - local: '8980'
       remote:
