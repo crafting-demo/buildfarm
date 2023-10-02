@@ -1,0 +1,76 @@
+---
+overview: |
+  # Bazel Buildfarm in a Sandbox.
+  
+  To connect, run
+
+  ```sh
+  cs port-forward -W SANDBOX/buildfarm
+  ```
+
+  Then, to use remote cache:
+
+  ```sh
+  bazel build --remote_cache=grpc://localhost:8980
+  ```
+
+  And use remote execution (also remote cache):
+
+  ```sh
+  bazel build --remote_executor=grpc://localhost:8980
+  ```
+
+volumes:
+  - name: bf-config
+    content:
+      text: |
+        backplane:
+          queues:
+          - name: "cpu"
+            properties:
+            - name: "min-cores"
+              value: "*"
+            - name: "max-cores"
+              value: "*"
+workspaces:
+  - name: buildfarm
+    checkouts:
+      - path: buildfarm
+        repo:
+          git: https://github.com/crafting-demo/buildfarm
+    port_forward_rules:
+    - local: '8980'
+      remote:
+        target: bf-server
+        port: grpc
+dependencies:
+  - name: redis
+    service_type: redis
+containers:
+  - name: bf-server
+    image: bazelbuild/buildfarm-server:v2.5.0
+    env:
+    - REDIS_URI=redis://redis:6379
+    - INSTANCE_NAME=${SANDBOX_WORKLOAD}:8980
+    ports:
+      - name: grpc
+        port: 8980
+        protocol: H2C/TCP
+      - name: http
+        port: 8982
+        protocol: HTTP/TCP
+    volume_mounts:
+      - name: bf-config
+        path: /app/build_buildfarm/examples/config.minimal.yml
+  - name: bf-worker
+    image: bazelbuild/buildfarm-worker:v2.5.0
+    env:
+    - REDIS_URI=redis://redis:6379
+    - INSTANCE_NAME=${SANDBOX_WORKLOAD}:8981
+    ports:
+    - name: grpc
+      port: 8981
+      protocol: H2C/TCP
+    volume_mounts:
+      - name: bf-config
+        path: /app/build_buildfarm/examples/config.minimal.yml
