@@ -5,7 +5,7 @@ overview: |
   To connect, run
 
   ```sh
-  cs port-forward -W SANDBOX/buildfarm
+  cs port-forward -W {{sandbox.name}}/buildfarm
   ```
 
   Then, to use remote cache:
