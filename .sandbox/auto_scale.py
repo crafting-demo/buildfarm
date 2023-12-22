@@ -77,22 +77,54 @@ def scale(g):
 
 
 def scale_up(g,server_metrics):
-    worker_num_in_tempalte,err = worker_num_defined_in_template()
+    template,err = sandbox_template()
     if err != None:
         return err
-    if worker_num_in_tempalte == g.expected_worker_num:
-        return None
-    # TODO update template
+    workers_in_template,err = workers_defined_in_template(template)
+    if err != None:
+        return err
+    scale_num = g.expected_worker_num - len(workers_in_template)  
+    if scale_num == 0:
+        return
+    for i in range(0,scale_num):
+        alloc_worker_to_template(template)
+    result = subprocess.run("cs sandbox edit --from -",input=json.dumps(template),capture_output=True, text=True)
+    if result.returncode != 0:
+        return result.stderr
+    return None
 
-    return
 
 def scale_down(g,server_metrics):
     # TODO
     return
 
-def worker_num_defined_in_template():
-    # TODO
-    return
+def sandbox_template():
+    result = subprocess.run(["cs","sandbox","show",g.sandbox_name,"-d","-o","json"],capture_output=True, text=True)
+    if result.returncode != 0 :
+        return None,result.stderr
+    data,err = parse_json(result.stdout)
+    return data,err
+
+
+def workers_defined_in_template(template):
+    return list(filter(lambda x: x.name.startWith("bf-worker"), template["containers"])), None
+
+def alloc_worker_to_template(template):
+    for ii in range (0,max_worker):
+        worker_name = "bf-worker"+str(ii)
+        if not template_has_bf_worker(template,worker_name):
+            worker = template["containers"][0].copy()
+            worker["name"] = worker_name
+            template["containers"].append(worker)
+
+
+def template_has_bf_worker(template,name):
+    for worker in workers_defined_in_template(template):
+        if worker.name == name:
+            return true
+
+    return false
+
 
 def scrape_buildfarm_server_metrics():
     server_metrics = BuildfarmServerMetrics()
@@ -118,29 +150,6 @@ def scrape_buildfarm_server_metrics():
     )
     print(server_metrics.worker_pool_size)
     
-
-def scale_down_if_need():
-    pass
-
-def scrape_queue_size():
-    result = subprocess.run(["prom2json",bf_server_prom_url],capture_output=True, text=True)
-    if result.returncode != 0:
-        return None,result.stderr
-    data,err = parse_json(result.stdout)
-    if err != None:
-        return None, str(err)
-    queue_size = 0
-    for obj in data:
-        if obj["name"] != "queue_name":
-            continue
-        for metric in obj.metrics:
-            queue_size += int(meric.value)
-        return queue_size,None
-    return 0,None
-
-
-    
-
 def install_promtojson_cli():
     result = subprocess.run(["which","prom2json"])
     if result.returncode == 0:
