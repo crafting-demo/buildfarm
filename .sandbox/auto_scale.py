@@ -5,9 +5,13 @@ import sys
 import os
 import subprocess
 import json
+import datetime
+
+bf_server_prom_url="http://bf-server:9090/metrics"
 
 class Global:
     sandbox_name = ""
+    queue_empty_start_time = 0
     def __init__(self):
         self.sandbox_name = os.getenv("SANDBOX_NAME")
         if self.sandbox_name == "" or self.sandbox_name == None:
@@ -28,18 +32,58 @@ def main():
 
 def scale_worker(g):
     # Query 
-    result = subprocess.run(["cs","sandbox","show",g.sandbox_name,"-d","-o","json"],capture_output=True, text=True)
-    if result.returncode != 0 :
-        log_error("failed to get sandbox information: " + result.stderr)
+    queue_size,err = scrape_queue_size()
+    if err != None:
+        log_error(err)
         return False
-    sandbox_def,error = parse_json(result.stdout)
-    if error != None:
-        log_error("failed to parse sandbox definition from json: "+ str(error))
+
+    scale_downed,err = scale_down_if_need(g)
+    if err != None:
+        log_error(err)
         return False
-    return
+    if scale_downed:
+        return
+
+    scale_upped,err = scale_up_if_need(g)
+    if err != None:
+        log_error(err)
+        return False
+    return None
+
+    #result = subprocess.run(["cs","sandbox","show",g.sandbox_name,"-d","-o","json"],capture_output=True, text=True)
+    #if result.returncode != 0 :
+    #    log_error("failed to get sandbox information: " + result.stderr)
+    #    return False
+    #sandbox_def,error = parse_json(result.stdout)
+    #if error != None:
+    #    log_error("failed to parse sandbox definition from json: "+ str(error))
+    #    return False
+    #return None
+
+def scale_down_if_need():
+    pass
+
+def scrape_queue_size():
+    result = subprocess.run(["prom2json",bf_server_prom_url],capture_output=True, text=True)
+    if result.returncode != 0:
+        return None,result.stderr
+    data,err = parse_json(result.stdout)
+    if err != None:
+        return None, str(err)
+    queue_size = 0
+    for obj in data:
+        if obj["name"] != "queue_name":
+            continue
+        for metric in obj.metrics:
+            queue_size += int(meric.value)
+        return queue_size,None
+    return 0,None
+
+
+    
 
 def install_promtojson_cli():
-    result = subprocess.run(["which","promtojson"])
+    result = subprocess.run(["which","prom2json"])
     if result.returncode == 0:
         return
     tmp_dir = "/tmp/sandbox_prom2json"
