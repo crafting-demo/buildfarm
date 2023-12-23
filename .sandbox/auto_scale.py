@@ -29,6 +29,10 @@ class BuildfarmServerMetrics:
     queue_size = 0
     worker_pool_size = 0 
 
+class BuildfarmWorkerMetrics:
+    execution_slot_usage = 0
+
+
 def main():
     install_promtojson_cli()
     g = Global()
@@ -84,7 +88,7 @@ def scale_up(g,server_metrics):
     if err != None:
         return err
     scale_num = g.expected_worker_num - len(workers_in_template)  
-    if scale_num == 0:
+    if scale_num <=  0:
         return
     for i in range(0,scale_num):
         alloc_worker_to_template(template)
@@ -95,8 +99,31 @@ def scale_up(g,server_metrics):
 
 
 def scale_down(g,server_metrics):
-    # TODO
-    return
+    template,err = sandbox_template()
+    if err != None:
+        return err
+    workers_in_template,err = workers_defined_in_template(template)
+    if err ! None:
+        return err
+
+    scale_num =  len(workers_in_template)  - g.expected_worker_num 
+    if scale_num <= 0:
+        return
+    
+    metrics ={}
+    for i in range(0,scale_num):
+        for worker in workers_in_template:
+            worker_metric,err = scrpae_buildfarm_worker_metrics("http://{}:9090/metric".format(worker.name))
+            if err == None:
+                metrics[worker.name] = worker_metric
+        idle_workers =list(filter(lambda x: x.execution_slot_usage ==0, metrics))
+        if len(idle_workers) == 0:
+            return None
+        template["containers"] = list(filter(lambda container : container.name != idle_workers[0].name,template["containers"] ))
+        result = subprocess.run("cs sandbox edit --from -",input=json.dumps(template),capture_output=True, text=True)
+        if result.returncode != 0:
+            return result.stderr
+    return None
 
 def sandbox_template():
     result = subprocess.run(["cs","sandbox","show",g.sandbox_name,"-d","-o","json"],capture_output=True, text=True)
@@ -148,7 +175,25 @@ def scrape_buildfarm_server_metrics():
             filter(lambda obj: obj["name"] == "worker_pool_size", data),
         ),
     )
-    print(server_metrics.worker_pool_size)
+
+def scrpae_buildfarm_worker_metrics(url):
+    metrics = BuildfarmWorkerMetrics()
+    result = subprocess.run(["prom2json",url],capture_output=True, text=True)
+    if result.returncode != 0 :
+        return None,result.stderr
+    data,err = parse_json(result.stdout)
+    if err != None:
+        return None,err
+    metrics.execution_slot_usage= functools.reduce(
+        lambda a,b: a+b,
+        map(
+            lambda metric: functools.reduce(lambda a,b:a+b,map(lambda x: int(x["value"]),metric["metrics"])),
+            filter(lambda obj: obj["name"] == "execution_slot_usage", data),
+        ),
+    )
+    return metrics,None
+
+
     
 def install_promtojson_cli():
     result = subprocess.run(["which","prom2json"])
