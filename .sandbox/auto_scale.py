@@ -52,7 +52,6 @@ def scale(g):
     if err != None:
         log.error("failed to scrape buildfarm server metrics: " + str(err))
         return False
-    print("DEBUG {} {}".format(server_metrics.queue_size, server_metrics.worker_pool_size))
     now = datetime.datetime.now()
     if server_metrics.queue_size > 0:
         if not g.is_scale_up_trending:
@@ -66,7 +65,6 @@ def scale(g):
             g.trending_start_time = now
     
     if (now - g.trending_start_time).total_seconds() >= scale_duration:
-        print("DEBUG reach scaling duration")
         if g.is_scale_up_trending and g.expected_worker_num <= server_metrics.worker_pool_size:
             g.expected_worker_num += 1
         if not g.is_scale_up_trending and g.expected_worker_num >= server_metrics.worker_pool_size:
@@ -76,7 +74,6 @@ def scale(g):
             g.expected_worker_num = max_worker
         if g.expected_worker_num <  min_worker:
             g.expected_worker_num = min_worker
-        print("DEBUG expecte worker {}".format(g.expected_worker_num))
 
     if g.expected_worker_num > server_metrics.worker_pool_size:
         return scale_up(g,server_metrics)
@@ -105,7 +102,6 @@ def scale_up(g,server_metrics):
 
 
 def scale_down(g,server_metrics):
-    print("DEBUG scale_down")
     template,err = sandbox_template(g)
     if err != None:
         return log_error(str(err))
@@ -124,13 +120,9 @@ def scale_down(g,server_metrics):
             if err == None:
                 metrics.append(worker_metric)
         idle_workers =list(filter(lambda x: x.execution_slot_usage ==0, metrics))
-        print("DEBUG idle_workers",idle_workers)
         if len(idle_workers) == 0:
             return None
-        print("DEBUG container ",len(template["containers"]))
-        print(idle_workers[0].worker_name)
         template["containers"] = list(filter(lambda container : container["name"] != idle_workers[0].worker_name,template["containers"] ))
-        print("DEBUG container ",len(template["containers"]))
         result = subprocess.run(["cs","sandbox","edit","--from","-"],input=json.dumps(template),capture_output=True, text=True)
         if result.returncode != 0:
             return result.stderr
