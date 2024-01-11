@@ -97,7 +97,7 @@ def scale_up(g,server_metrics):
     for i in range(0,scale_num):
         alloc_worker_to_template(template)
     log("updating sandbox")
-    result = subprocess.run(["cs","sandbox","edit","--keep","--force","--from","-"],input=json.dumps(template),text=True,stdout=subprocess.DEVNULL)
+    result = subprocess.run(["cs","sandbox","edit","--force","--from","-"],input=json.dumps(template),text=True,stdout=subprocess.DEVNULL)
     if result.returncode != 0:
         log_error("failed to scale up worker: {}".format(result.stderr))
         return result.stderr
@@ -133,7 +133,7 @@ def scale_down(g,server_metrics):
         log("All workers are busy, do not remove now")
         return None
     log("updating sandbox")
-    result = subprocess.run(["cs","sandbox","edit","--keep","--force","--from","-"],input=json.dumps(template),text=True, stdout=subprocess.DEVNULL)
+    result = subprocess.run(["cs","sandbox","edit","--force","--from","-"],input=json.dumps(template),text=True, stdout=subprocess.DEVNULL)
     if result.returncode != 0:
         log_error("failed to scale down worker: {}".result.stderr)
         return result.stderr
