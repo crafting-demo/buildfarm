@@ -50,17 +50,18 @@ def main():
 def scale(g):
     server_metrics,err = scrape_buildfarm_server_metrics()
     if err != None:
-        log.error("failed to scrape buildfarm server metrics: " + str(err))
+        log_error("failed to scrape buildfarm server metrics: " + str(err))
         return False
     now = datetime.datetime.now()
+    log("{} , queue size is {}".format(now,server_metrics.queue_size))
     if server_metrics.queue_size > 0:
         if not g.is_scale_up_trending:
-            log("queue_szie is {}, switching to scale up trending".format(server_metrics.queue_size))
+            log("queue_szie is {}, switched to scale up trending".format(server_metrics.queue_size))
             g.is_scale_up_trending = True
             g.trending_start_time = now
     else:
         if g.is_scale_up_trending:
-            log("queue_szie is 0, switching to scale down trending")
+            log("queue_szie is 0, switched to scale down trending")
             g.is_scale_up_trending = False
             g.trending_start_time = now
     
@@ -95,9 +96,12 @@ def scale_up(g,server_metrics):
     log("scaling up to {} workers, need to add {} worker".format(g.expected_worker_num, scale_num))
     for i in range(0,scale_num):
         alloc_worker_to_template(template)
-    result = subprocess.run(["cs","sandbox","edit","-f","-"],input=json.dumps(template),capture_output=True, text=True)
+    log("updating sandbox")
+    result = subprocess.run(["cs","sandbox","edit","--keep","--force","--from","-"],input=json.dumps(template),text=True,stdout=subprocess.DEVNULL)
     if result.returncode != 0:
+        log_error("failed to scale up worker: {}".format(result.stderr))
         return result.stderr
+    log("scaled worker num to {}".format(g.expected_worker_num))
     return None
 
 
@@ -114,6 +118,7 @@ def scale_down(g,server_metrics):
     log("scaling down to {} workers, need to remove {} worker".format(g.expected_worker_num, scale_num))
     
     metrics =[]
+    has_idled_worker = False
     for i in range(0,scale_num):
         for worker in workers_in_template:
             worker_metric,err = scrpae_buildfarm_worker_metrics(worker["name"])
@@ -121,11 +126,18 @@ def scale_down(g,server_metrics):
                 metrics.append(worker_metric)
         idle_workers =list(filter(lambda x: x.execution_slot_usage ==0, metrics))
         if len(idle_workers) == 0:
-            return None
+            continue
+        has_idled_worker = True
         template["containers"] = list(filter(lambda container : container["name"] != idle_workers[0].worker_name,template["containers"] ))
-        result = subprocess.run(["cs","sandbox","edit","--from","-"],input=json.dumps(template),capture_output=True, text=True)
-        if result.returncode != 0:
-            return result.stderr
+    if not has_idled_worker:
+        log("All workers are busy, do not remove now")
+        return None
+    log("updating sandbox")
+    result = subprocess.run(["cs","sandbox","edit","--keep","--force","--from","-"],input=json.dumps(template),text=True, stdout=subprocess.DEVNULL)
+    if result.returncode != 0:
+        log_error("failed to scale down worker: {}".result.stderr)
+        return result.stderr
+    log("scaled down worker to {}".format(len(workers_defined_in_template(template))))
     return None
 
 def sandbox_template(g):
@@ -134,7 +146,7 @@ def sandbox_template(g):
         return None,result.stderr
     data,err = parse_json(result.stdout)
     return data,err
-
+ 
 
 def workers_defined_in_template(template):
     return list(filter(lambda container: container["name"].startswith("bf-worker"), template["containers"]))
