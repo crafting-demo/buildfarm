@@ -35,6 +35,7 @@ volumes:
               value: "*"
 workspaces:
   - name: buildfarm
+    disable_service_linking_envs: true
     checkouts:
       - path: buildfarm
         repo:
@@ -53,6 +54,7 @@ dependencies:
 containers:
   - name: bf-server
     image: bazelbuild/buildfarm-server:v2.5.0
+    disable_service_linking_envs: true
     env:
     - REDIS_URI=redis://redis:6379
     - INSTANCE_NAME=${SANDBOX_WORKLOAD}:8980
@@ -68,6 +70,7 @@ containers:
         path: /app/build_buildfarm/examples/config.minimal.yml
   - name: bf-worker
     image: bazelbuild/buildfarm-worker:v2.5.0
+    disable_service_linking_envs: true
     env:
     - REDIS_URI=redis://redis:6379
     - INSTANCE_NAME=${SANDBOX_WORKLOAD}:8981
