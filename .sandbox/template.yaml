@@ -65,6 +65,12 @@ containers:
       - name: http
         port: 8982
         protocol: HTTP/TCP
+    probes:
+      readiness:
+        - name: promethues
+          http_get:
+            port: 9090
+            path: /
     volume_mounts:
       - name: bf-config
         path: /app/build_buildfarm/examples/config.minimal.yml
@@ -78,6 +84,12 @@ containers:
     - name: grpc
       port: 8981
       protocol: H2C/TCP
+    probes:
+      readiness:
+        - name: promethues
+          http_get:
+            port: 9090
+            path: /
     volume_mounts:
       - name: bf-config
         path: /app/build_buildfarm/examples/config.minimal.yml
