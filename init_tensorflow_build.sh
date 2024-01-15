@@ -30,4 +30,4 @@ EOF`
 python3 -c "$c" "$template_json"
 cp remote_build_tensorflow.sh /home/owner/tensorflow/remote_build_tensorflow.sh
 
-echo "Successful. Now you could 'cd ~/tensorflow && remote_build_tensorflow.sh'"
+echo "Successful. Now you could 'cd ~/tensorflow && remote_build_tensorflow.sh' . The worker nodes will auto scale when compiling tensorflow"
