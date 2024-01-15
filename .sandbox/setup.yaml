@@ -8,4 +8,4 @@ hooks:
 daemons:
   autoscale: 
     run:
-      cmd: python3 .sandbox/auto-scale.py
+      cmd: python3 .sandbox/auto_scale.py
