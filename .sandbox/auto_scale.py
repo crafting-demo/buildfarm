@@ -7,6 +7,8 @@ import subprocess
 import json
 import datetime
 import functools
+import requests
+import io
 
 # How often to scrape metrics and try to scale. Could config by setting environment variable BF_SCRAPE_PERIOD=xxx
 scrape_period=5 
@@ -52,7 +54,6 @@ def main():
     log("trending_duration: {}".format(trending_duration))
     log("min_worker: {}".format(min_worker))
     log("max_worker: {}".format(max_worker))
-    install_promtojson_cli()
     g = Global()
 
     while True:
@@ -235,40 +236,81 @@ def has_bf_worker(workers,name):
 # Scrape the metrics of buildfarm server.
 def scrape_buildfarm_server_metrics():
     server_metrics = BuildfarmServerMetrics()
-    result = subprocess.run(["prom2json",bf_server_metrics_url],capture_output=True, text=True)
-    if result.returncode != 0:
-        return None, result.stderr
-    data,err = parse_json(result.stdout)
-    if err != None:
+    try:
+        response = requests.get(bf_server_metrics_url)
+        response.close()
+        if response.status_code != 200:
+            return None,response.text
+    except Exception as error:
         return None,err
+    metrics = parse_metrics(response.text)
+    queue_size_key="queue_size"
+    worker_pool_size_key = "worker_pool_size"
 
-    queue_size_metric = list(map(
-        lambda metric: functools.reduce(lambda a,b:a+b,map(lambda x: int(x["value"]),metric["metrics"])),
-        filter(lambda obj: obj["name"] == "queue_size", data),
-    ))
-    if len(queue_size_metric) > 0:
-        server_metrics.queue_size = functools.reduce(
-            lambda a,b: a+b,
-            queue_size_metric,
-        )
-    worker_pool_size_metric =list(map(
-        lambda metric: functools.reduce(lambda a,b:a+b,map(lambda x: int(x["value"]),metric["metrics"])),
-        filter(lambda obj: obj["name"] == "worker_pool_size", data),
-    ))
-    if len(worker_pool_size_metric) > 0:
-        server_metrics.worker_pool_size = functools.reduce(
-            lambda a,b: a+b,
-            worker_pool_size_metric,
-        )
+    if not queue_size_key in metrics:
+        return None, "metric {} not found".format(queue_size_key)
+    queue_size = 0
+    for k,v in metrics[queue_size_key].items():
+        server_metrics.queue_size += int(float(v))
+    if not worker_pool_size_key in metrics:
+        return None, "metric {} not found".format(worker_pool_size_key)
 
+    server_metrics.worker_pool_size = int(float(metrics[worker_pool_size_key]))
     return server_metrics,None
+
+def parse_metrics(content):
+    buf = io.StringIO(content)
+    metrics = {}
+    while True:
+        line = buf.readline()
+        if len(line) == 0:
+            break
+        if line.startswith("#"):
+            continue
+        # Trim begin and end space
+        line = line.strip()
+        try:
+            index = line.rindex(" ")
+        except Exception as error:
+            continue
+        key = line[:index]
+        value = line[index+1:]
+        try:
+            label_index = key.index("{")
+        except Exception as error:
+            metrics[key] = value
+            continue
+        label = key[label_index:]
+        group=key[:label_index]
+        if group in metrics:
+            metrics[group][label] = value
+        else:
+            metrics[group]={label:value}
+    return metrics
+
 
 # Scrape the metrics of a buildfarm worker.
 def scrape_buildfarm_worker_metrics(worker_name):
     url = "http://{}:9090/metric".format(worker_name)
-    metrics = BuildfarmWorkerMetrics() 
-    metrics.worker_name = worker_name
+    worker_metrics = BuildfarmWorkerMetrics() 
+    worker_metrics.worker_name = worker_name
+
     result = subprocess.run(["prom2json",url],capture_output=True, text=True)
+    try:
+        response = requests.get(url)
+        response.close()
+        if response.status_code != 200:
+            return None,response.text
+    except Exception as error:
+        return None,err
+
+    metrics = parse_metrics(response.text)
+    slot_usage_key = "execution_slot_usage"
+    if not slot_usage_key in metrics:
+        return None, "metrics {} not found".format(slot_usage_key)
+    worker_metrics.execution_slot_usage = int(float(metric[slot_usage_key]))
+
+
     if result.returncode != 0 :
         return None,result.stderr
     data,err = parse_json(result.stdout)
@@ -282,29 +324,6 @@ def scrape_buildfarm_worker_metrics(worker_name):
         ),
     )
     return metrics,None
-
-
-    
-def install_promtojson_cli():
-    result = subprocess.run(["which","prom2json"],stdout=subprocess.DEVNULL)
-    if result.returncode == 0:
-        return
-    tmp_dir = "/tmp/sandbox_prom2json"
-    download_file_path = tmp_dir + "/protm2json.tar.gz"
-    extract_dir_path = tmp_dir + "/uncompressed"
-    if subprocess.run(["mkdir","-p",extract_dir_path]).returncode != 0:
-        fatal("failed to create directory " + extract_dir_path)
-    download_url = "https://github.com/prometheus/prom2json/releases/download/v1.3.3/prom2json-1.3.3.linux-amd64.tar.gz"
-    log("Downloading protm2json from " + download_url)
-    download_result = subprocess.run(["curl","-Ss","-L","-o",download_file_path, download_url])
-    if download_result.returncode != 0:
-        fatal("failed to download protm2json")
-    tar_result = subprocess.run(["tar","-xf",download_file_path,"-C",extract_dir_path,"--strip-components=1"])
-    if tar_result.returncode != 0:
-        fatal("failed to uncompressed prom2json")
-    if subprocess.run(["sudo","cp",extract_dir_path+"/prom2json", "/usr/bin/"]).returncode != 0:
-        fatal("failed to install prom2json")
-    log("protm2json installed")
 
 def log_error(msg):
     if isinstance(msg, str):
