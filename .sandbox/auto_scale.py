@@ -8,10 +8,18 @@ import json
 import datetime
 import functools
 
-bf_server_metrics_url="http://bf-server:9090/metrics"
-scale_duration = 10
+# How often to scrape metrics and try to scale. Could config by setting environment variable BF_SCRAPE_PERIOD=xxx
+scrape_period=5 
+# When an error occurs, the delay of retrying. Unit is sceond.
+delay_of_retry=1
+# Start to scale up/down when the trend of scaliing up/down  has lasted for the period of time. Unit is second
+trending_duration = 10
+# Minimal number of buildfarm worker. Could config by setting environment variable BF_MIN_WORKER=xxx. The value must greater than 0
 min_worker = 1
+# Maximal number fo buildfarm worker. Could config by setting environment variable BF_MAX_WORKER=xxx. The value muster greater equal than min_worker
 max_worker = 4
+
+bf_server_metrics_url="http://bf-server:9090/metrics"
 
 class Global:
     sandbox_name = ""
@@ -25,16 +33,25 @@ class Global:
             print('Failed to get sandbox name', file=sys.stderr)
             sys.exit(1)
 
+
+# Metrics scraped from buldfarm server
 class BuildfarmServerMetrics:
     queue_size = 0
     worker_pool_size = 0 
 
+# Metrics scraped from buildfarm worker
 class BuildfarmWorkerMetrics:
     worker_name = ""
     execution_slot_usage = 0
 
 
 def main():
+    load_config()
+    log("scrape_period: {}".format(scrape_period))
+    log("delay_of_retry: {}".format(delay_of_retry))
+    log("trending_duration: {}".format(trending_duration))
+    log("min_worker: {}".format(min_worker))
+    log("max_worker: {}".format(max_worker))
     install_promtojson_cli()
     g = Global()
 
@@ -42,10 +59,43 @@ def main():
         err = scale(g)
         if err != None:
             log_error(str(err))
-            time.sleep(2)
+            time.sleep(delay_of_retry)
             continue
-        time.sleep(5)
+        time.sleep(scrape_period)
     return
+
+def load_config():
+    global min_worker
+    global max_worker
+    global scrape_period
+    global delay_of_retry
+    global trending_duration
+
+    min_worker = load_env_or_default("BF_MIN_WORKER",min_worker)
+    if min_worker < 1:
+        min_worker = 1
+    
+    max_worker = load_env_or_default("BF_MAX_WORKER",max_worker)
+    if max_worker < min_worker:
+        max_worker = min_worker
+    
+    scrape_period = load_env_or_default("BF_SCRAPE_PERIOD",scrape_period)
+    if scrape_period <=0:
+        scrape_period = 1
+    
+    delay_of_retry = load_env_or_default("BF_SCALE_DELAY_OF_RETRY",delay_of_retry)
+    if delay_of_retry < 0:
+        delay_of_retry = 0
+    
+    trending_duration = load_env_or_default("BF_SCALE_TRENDING_DURATION",trending_duration)
+
+def load_env_or_default(key,default):
+    v = os.getenv(key)
+    if v == None:
+        return default
+    return int(v)
+    
+
 
 def scale(g):
     server_metrics,err = scrape_buildfarm_server_metrics()
@@ -54,6 +104,9 @@ def scale(g):
         return False
     now = datetime.datetime.now()
     log("{} , queue size is {}".format(now,server_metrics.queue_size))
+    # Update scale trending. 
+    # If actions queue size greater than 0, update the scale trending to scale up trending(add worker). 
+    # Otherwise, update the scale trending to scale down trending(remove worker).
     if server_metrics.queue_size > 0:
         if not g.is_scale_up_trending:
             log("queue_szie is {}, switched to scale up trending".format(server_metrics.queue_size))
@@ -65,12 +118,16 @@ def scale(g):
             g.is_scale_up_trending = False
             g.trending_start_time = now
     
-    if (now - g.trending_start_time).total_seconds() >= scale_duration:
+    # Update expected worker number when the trend has lasted for a certain period of time
+    if (now - g.trending_start_time).total_seconds() >= trending_duration:
+        # The server_metrics.worker_pool_size is the number of worker that has connected to the buildfarm server
+        # Only scale up/down when the previous scaled worker has really connected to buildfarm server.
         if g.is_scale_up_trending and g.expected_worker_num <= server_metrics.worker_pool_size:
             g.expected_worker_num += 1
         if not g.is_scale_up_trending and g.expected_worker_num >= server_metrics.worker_pool_size:
             g.expected_worker_num -= 1
 
+        # Limit min and max worker.
         if g.expected_worker_num > max_worker:
             g.expected_worker_num = max_worker
         if g.expected_worker_num <  min_worker:
@@ -85,6 +142,7 @@ def scale(g):
     return None
 
 
+# Scale up the worker by updating the sandbox definition.
 def scale_up(g,server_metrics):
     template,err = sandbox_template(g)
     if err != None:
@@ -105,10 +163,11 @@ def scale_up(g,server_metrics):
     return None
 
 
+# Scale down the workers by updating the sandbox definition.
 def scale_down(g,server_metrics):
     template,err = sandbox_template(g)
     if err != None:
-        return log_error(str(err))
+        return log_error(err)
     workers_in_template = workers_defined_in_template(template)
 
     scale_num =  len(workers_in_template)  - g.expected_worker_num 
@@ -121,7 +180,7 @@ def scale_down(g,server_metrics):
     has_idled_worker = False
     for i in range(0,scale_num):
         for worker in workers_in_template:
-            worker_metric,err = scrpae_buildfarm_worker_metrics(worker["name"])
+            worker_metric,err = scrape_buildfarm_worker_metrics(worker["name"])
             if err == None:
                 metrics.append(worker_metric)
         idle_workers =list(filter(lambda x: x.execution_slot_usage ==0, metrics))
@@ -140,6 +199,7 @@ def scale_down(g,server_metrics):
     log("scaled down worker to {}".format(len(workers_defined_in_template(template))))
     return None
 
+# Get sandbox definition
 def sandbox_template(g):
     result = subprocess.run(["cs","sandbox","show",g.sandbox_name,"-d","-o","json"],capture_output=True, text=True)
     if result.returncode != 0 :
@@ -148,9 +208,11 @@ def sandbox_template(g):
     return data,err
  
 
+# Get buildfarm-workers containers in sandbox definition
 def workers_defined_in_template(template):
     return list(filter(lambda container: container["name"].startswith("bf-worker"), template["containers"]))
 
+# Add one buildfarm-worker container to definition
 def alloc_worker_to_template(template):
     workers = workers_defined_in_template(template)
     for ii in range (0,max_worker):
@@ -170,6 +232,7 @@ def has_bf_worker(workers,name):
     return False
 
 
+# Scrape the metrics of buildfarm server.
 def scrape_buildfarm_server_metrics():
     server_metrics = BuildfarmServerMetrics()
     result = subprocess.run(["prom2json",bf_server_metrics_url],capture_output=True, text=True)
@@ -200,7 +263,8 @@ def scrape_buildfarm_server_metrics():
 
     return server_metrics,None
 
-def scrpae_buildfarm_worker_metrics(worker_name):
+# Scrape the metrics of a buildfarm worker.
+def scrape_buildfarm_worker_metrics(worker_name):
     url = "http://{}:9090/metric".format(worker_name)
     metrics = BuildfarmWorkerMetrics() 
     metrics.worker_name = worker_name
@@ -222,7 +286,7 @@ def scrpae_buildfarm_worker_metrics(worker_name):
 
     
 def install_promtojson_cli():
-    result = subprocess.run(["which","prom2json"])
+    result = subprocess.run(["which","prom2json"],stdout=subprocess.DEVNULL)
     if result.returncode == 0:
         return
     tmp_dir = "/tmp/sandbox_prom2json"
@@ -242,13 +306,11 @@ def install_promtojson_cli():
         fatal("failed to install prom2json")
     log("protm2json installed")
 
-
-
-
-
-
 def log_error(msg):
-    print("Error: " + msg, file=sys.stderr)
+    if isinstance(msg, str):
+        print("Error: " + msg, file=sys.stderr)
+    else:
+        print("Error: " + str(msg), file=sys.stderr)
 
 def log(msg):
     print(msg)
