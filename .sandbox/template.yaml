@@ -24,7 +24,6 @@ volumes:
   - name: bf-config
     content:
       text: |
-        prometheusPort: 9090
         backplane:
           queues:
           - name: "cpu"
