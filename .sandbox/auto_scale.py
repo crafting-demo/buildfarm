@@ -23,9 +23,9 @@ max_worker = 4
 
 bf_server_metrics_url="http://bf-server:9090/metrics"
 
+# A class to store global infromation.
 class Global:
     sandbox_name = ""
-    queue_empty_start_time = 0
     expected_worker_num = 1
     is_scale_up_trending = True
     trending_start_time = datetime.datetime.now()
