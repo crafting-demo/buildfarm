@@ -10,8 +10,8 @@ import functools
 import requests
 import io
 
-# How often to scrape metrics and try to scale. Could config by setting environment variable BF_SCRAPE_PERIOD=xxx
-scrape_period=5 
+# How often to scrape metrics and try to scale. Could config by setting environment variable BF_SCRAPE_INTERVAL=xxx
+scrape_interval=5 
 # When an error occurs, the delay of retrying. Unit is sceond.
 delay_of_retry=1
 # Start to scale up/down when the trend of scaliing up/down  has lasted for the period of time. Unit is second
@@ -49,7 +49,7 @@ class BuildfarmWorkerMetrics:
 
 def main():
     load_config()
-    log("scrape_period: {}".format(scrape_period))
+    log("scrape_interval: {}".format(scrape_interval))
     log("delay_of_retry: {}".format(delay_of_retry))
     log("trending_duration: {}".format(trending_duration))
     log("min_worker: {}".format(min_worker))
@@ -62,13 +62,13 @@ def main():
             log_error(str(err))
             time.sleep(delay_of_retry)
             continue
-        time.sleep(scrape_period)
+        time.sleep(scrape_interval)
     return
 
 def load_config():
     global min_worker
     global max_worker
-    global scrape_period
+    global scrape_interval
     global delay_of_retry
     global trending_duration
 
@@ -80,9 +80,9 @@ def load_config():
     if max_worker < min_worker:
         max_worker = min_worker
     
-    scrape_period = load_env_or_default("BF_SCRAPE_PERIOD",scrape_period)
-    if scrape_period <=0:
-        scrape_period = 1
+    scrape_interval= load_env_or_default("BF_SCRAPE_INTERVAL",scrape_interval)
+    if scrape_interval <=0:
+        scrape_interval = 1
     
     delay_of_retry = load_env_or_default("BF_SCALE_DELAY_OF_RETRY",delay_of_retry)
     if delay_of_retry < 0:
