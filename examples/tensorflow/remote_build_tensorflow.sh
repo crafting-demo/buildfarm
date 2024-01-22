@@ -2,10 +2,14 @@
 
 set -e 
 
+SCRIPT_DIR=$(dirname $0)
+TENSORFLOW_REPO_DIR=${SCRIPT_DIR}/tensorflow
+
+
 CONTAINER_NAME="bf-worker-bash"
 
 if [[ $1 == "" ]];then
-	docker port $CONTAINER_NAME || docker run -dt --network host --name $CONTAINER_NAME -v /home/owner/tensorflow:/tensorflow koitown/buildfarm-worker-bash:v2.5.0
+	docker port $CONTAINER_NAME || docker run -dt --network host --name $CONTAINER_NAME -v ${TENSORFLOW_REPO_DIR}:/tensorflow koitown/buildfarm-worker-bash:v2.5.0
 	docker exec -it $CONTAINER_NAME bash -c "cd /tensorflow && bash $0 build"
 	
 else

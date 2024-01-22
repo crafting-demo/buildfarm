@@ -3,7 +3,10 @@
 
 set -e
 
-[[ -e "/home/owner/tensorflow" ]] || git clone --depth=1 --branch=v2.15.0 https://github.com/tensorflow/tensorflow.git /home/owner/tensorflow
+SCRIPT_DIR=$(dirname $0)
+TENSORFLOW_REPO_DIR="${SCRIPT_DIR}/tensorflow"
+
+[[ -e TENSORFLOW_REPO_DIR ]] || git clone --depth=1 --branch=v2.15.0 https://github.com/tensorflow/tensorflow.git $TENSORFLOW_REPO_DIR
 
 # Change bf-worker image to koitown/bf-worker:v2.5.0. When remote building tensorflow, we need clang-16 in the bf-worker container.
 echo "Updating sandbox bf-worker image"
@@ -28,6 +31,6 @@ if result.returncode !=0 :
 EOF`
 
 python3 -c "$c" "$template_json"
-cp remote_build_tensorflow.sh /home/owner/tensorflow/remote_build_tensorflow.sh
+cp remote_build_tensorflow.sh $TENSORFLOW_REPO_DIR/remote_build_tensorflow.sh
 
-echo "Successful. Now you could 'cd ~/tensorflow && remote_build_tensorflow.sh' . The worker nodes will auto scale when compiling tensorflow"
+echo "Successful. Now you could run remote_build_tensorflow.sh to build tensorflow. The worker nodes will auto scale when compiling tensorflow"
