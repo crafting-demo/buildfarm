@@ -10,6 +10,8 @@ CONTAINER_NAME="bf-worker-bash"
 
 if [[ $1 == "" ]];then
 	docker port $CONTAINER_NAME || docker run -dt --network host --name $CONTAINER_NAME -v ${TENSORFLOW_REPO_DIR}:/tensorflow koitown/buildfarm-worker-bash:v2.5.0
+	# The container may be stopped when sandbox suspends.
+	docker start $CONTAINER_NAME
 	docker exec -it $CONTAINER_NAME bash -c "cd /tensorflow && bash $0 build"
 	
 else
