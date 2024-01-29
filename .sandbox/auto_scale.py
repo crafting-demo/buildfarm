@@ -165,17 +165,9 @@ class AutoScaler:
     # The maximum number of workers.
     max_workers = _int_from_env_or("BF_MAX_WORKERS", 4)
 
-    # The minimum number of idle workers.
-    # This is used during scale-in to make sure the minimum idle workers
-    # are retained.
-    # If there are too few idle workers, during the spike of build requests
-    # may cause longer waiting time on the client side.
-    # But the more idle workers, the more resource will be consumed.
-    min_idle_workers = _int_from_env_or("BF_MIN_IDLE_WORKERS", 0)
-
     # The seconds to wait before taking the action since
     # the scaling is demanded.
-    wait_period = _int_from_env_or("BF_WAIT_PERIOD", 10)
+    wait_period = _int_from_env_or("BF_WAIT_PERIOD", 60)
 
     # The seconds between scrapes of the metrics.
     scrape_interval = _int_from_env_or("BF_SCRAPE_INTERVAL", 5)
@@ -302,15 +294,10 @@ class AutoScaler:
             if values.sum("execution_slot_usage") == 0:
                 idle_workers.append(worker["name"])
 
-        # If the number does not excceed min_idle_workers, do nothing.
-        if len(idle_workers) <= self.min_idle_workers:
-            return
-        # Keep min_idle_workers and capped at count.
-        idle_workers = idle_workers[self.min_idle_workers:][:count]
         if len(idle_workers) == 0:
             return
 
-        idle_worker_names = {x: True for x in idle_workers}
+        idle_worker_names = {x: True for x in idle_workers[:count]}
         template["containers"] = list(filter(
             lambda container : container["name"] not in idle_worker_names,
             template["containers"]))
