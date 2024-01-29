@@ -73,7 +73,7 @@ containers:
     volume_mounts:
       - name: bf-config
         path: /app/build_buildfarm/examples/config.minimal.yml
-  - name: bf-worker
+  - name: bf-worker-0
     image: bazelbuild/buildfarm-worker:v2.5.0
     disable_service_linking_envs: true
     env:
