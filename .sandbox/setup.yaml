@@ -5,3 +5,7 @@ hooks:
         sudo wget -O /usr/local/bin/bazel https://github.com/bazelbuild/bazel/releases/download/6.3.2/bazel-6.3.2-linux-x86_64
         sudo chmod a+rx /usr/local/bin/bazel
       }
+daemons:
+  autoscale: 
+    run:
+      cmd: python3 .sandbox/auto_scale.py

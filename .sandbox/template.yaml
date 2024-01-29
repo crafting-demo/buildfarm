@@ -34,6 +34,7 @@ volumes:
               value: "*"
 workspaces:
   - name: buildfarm
+    disable_service_linking_envs: true
     checkouts:
       - path: buildfarm
         repo:
@@ -52,6 +53,7 @@ dependencies:
 containers:
   - name: bf-server
     image: bazelbuild/buildfarm-server:v2.5.0
+    disable_service_linking_envs: true
     env:
     - REDIS_URI=redis://redis:6379
     - INSTANCE_NAME=${SANDBOX_WORKLOAD}:8980
@@ -62,11 +64,18 @@ containers:
       - name: http
         port: 8982
         protocol: HTTP/TCP
+    probes:
+      readiness:
+        - name: promethues
+          http_get:
+            port: 9090
+            path: /
     volume_mounts:
       - name: bf-config
         path: /app/build_buildfarm/examples/config.minimal.yml
   - name: bf-worker
     image: bazelbuild/buildfarm-worker:v2.5.0
+    disable_service_linking_envs: true
     env:
     - REDIS_URI=redis://redis:6379
     - INSTANCE_NAME=${SANDBOX_WORKLOAD}:8981
@@ -74,6 +83,12 @@ containers:
     - name: grpc
       port: 8981
       protocol: H2C/TCP
+    probes:
+      readiness:
+        - name: promethues
+          http_get:
+            port: 9090
+            path: /
     volume_mounts:
       - name: bf-config
         path: /app/build_buildfarm/examples/config.minimal.yml
