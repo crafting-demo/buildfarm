@@ -11,31 +11,20 @@ The sandbox will not be linked to any template once it's updated.
 """
 
 import time
-import sys
 import os
 import subprocess
 import json
 import datetime
 import io
 import urllib.request
-
-
-# The URL for collecting metrics from the buildfarm server.
-BF_SERVER_METRICS_URL="http://bf-server:9090/metrics"
-
-
-def _int_from_env_or(key, default):
-    """Load integer from env or use the default."""
-    val = os.getenv(key)
-    if val is None:
-        return default
-    return int(val)
+import logging
+import traceback
 
 
 def _fetch_url(url: str) -> str:
     """Returns the payload from an HTTP GET request."""
     with urllib.request.urlopen(url) as reply:
-        return reply.read()
+        return reply.read().decode('utf-8')
 
 
 def _cs_sandbox(args: list[str], **kwargs):
@@ -80,7 +69,8 @@ class ValuesByKey:
     from the metrics named by the key.
     """
 
-    values_by_key = {}
+    def __init__(self):
+        self.values_by_key = {}
 
     def add(self, key: str, value: float):
         """Add a new value."""
@@ -157,42 +147,57 @@ class AutoScaler:
     be smaller than 1.
     """
 
-    # Following are the parameters for auto-scaling.
 
-    # The minimum number of workers.
-    min_workers = _int_from_env_or("BF_MIN_WORKERS", 1)
-
-    # The maximum number of workers.
-    max_workers = _int_from_env_or("BF_MAX_WORKERS", 4)
-
-    # The seconds to wait before taking the action since
-    # the scaling is demanded.
-    wait_period = _int_from_env_or("BF_WAIT_PERIOD", 60)
-
-    # The seconds between scrapes of the metrics.
-    scrape_interval = _int_from_env_or("BF_SCRAPE_INTERVAL", 5)
-
-    # The seconds of delay before next retry.
-    retry_delay = _int_from_env_or("BF_RETRY_DELAY", 1)
-
-    # Following are the states for controling the scaling.
-
-    # If scale-out is demanded - not sufficient workers.
-    scale_out_demanded = True
-
-    # Scale demanded time.
-    scaling_demanded_at: datetime.datetime | None = None
+    # pylint: disable=too-many-instance-attributes
+    # These are parameters for auto-scaling.
 
     def __init__(self):
-        sandbox_name = os.getenv("SANDBOX_FULL_NAME")
-        if sandbox_name == "" or sandbox_name is None:
+        self.sandbox_name = os.environ.get("SANDBOX_FULL_NAME", "")
+        if self.sandbox_name == "":
             raise ParameterError("sandbox name unknown")
-        self._sandbox_name = sandbox_name
 
+        self.server_url = os.environ.get("BF_SERVER_URL", "http://bf-server:9090/metrics")
+
+        # Following are the parameters for auto-scaling.
+
+        # The minimum number of workers.
+        self.min_workers = int(os.environ.get("BF_MIN_WORKERS", "1"))
         if self.min_workers < 1:
             raise ParameterError(f"min_workers {self.min_workers} < 1")
+
+        # The maximum number of workers.
+        self.max_workers = int(os.environ.get("BF_MAX_WORKERS", "4"))
         if self.max_workers < self.min_workers:
             raise ParameterError(f"max_workers {self.max_workers} < min_workers {self.min_workers}")
+
+        # The seconds to wait before taking the action since scale-out is demanded.
+        # This value can be relatively small for more aggresive scale-out.
+        self.wait_scale_out = int(os.environ.get("BF_WAIT_SCALE_OUT", "5"))
+
+        # The seconds to wait before taking the action since scale-in is demanded.
+        # This value can be relatively large for less aggresive scale-in.
+        self.wait_scale_in = int(os.environ.get("BF_WAIT_SCALE_IN", "60"))
+
+        # The seconds to cool-down before next scale-out can happen.
+        self.scale_out_cool_down = int(os.environ.get("BF_SCALE_OUT_COOL_DOWN", "60"))
+
+        # The seconds between scrapes of the metrics.
+        self.scrape_interval = int(os.environ.get("BF_SCRAPE_INTERVAL", "5"))
+
+        # The seconds of delay before next retry.
+        self.retry_delay = int(os.environ.get("BF_RETRY_DELAY", "1"))
+
+        # Following are the states for controling the scaling.
+
+        # If scale-out/in is demanded.
+        # This is the time with wait and cool-down taken into consideration.
+        # The actual scaling should not happen before this time.
+        self._scale_out_after: datetime.datetime | None = None
+        self._scale_in_after: datetime.datetime | None = None
+
+        # The scale-out cool-down time.
+        # Scale-out should NOT be demanded before this time.
+        self._scale_out_cool_down_before = datetime.datetime.now()
 
 
     def monitor_loop(self):
@@ -202,57 +207,46 @@ class AutoScaler:
                 self.scrape_and_scale()
                 time.sleep(self.scrape_interval)
             except Exception as error: # pylint: disable=broad-except
-                print(str(error), file=sys.stderr)
+                traceback.print_exception(error)
                 time.sleep(self.retry_delay)
 
 
     def scrape_and_scale(self):
         """Scrape the metrics and perform auto-scaling if needed."""
 
-        server_metrics = scrape_metrics_from(BF_SERVER_METRICS_URL)
+        server_metrics = scrape_metrics_from(self.server_url)
         queue_size = server_metrics.sum("queue_size")
-        worker_pool_size = server_metrics.sum("worker_pool_size")
 
         now = datetime.datetime.now()
 
-        # When scaling_demanded_at is not None, wait_period is activated.
-        # Once wait_period elapsed, scaling action will be attempted.
-        # If scaling_demanded_at is None, no action should be performed.
+        logging.debug("Scrape queue_size=%d", queue_size)
+
+        # When scale-out/in is demanded, wait period is activated.
+        # After the wait_period elapsed, scaling action will be attempted.
 
         # Calculate scaling demand:
         # - demand scale-out if queue_size is greater than 0.
-        # - otherwise, after wait_delay attempt to remove idle workers.
-        # This only sets/cancels the scaling demand, the actual action will
-        # be performed after wait_period elapsed.
+        # - otherwise, always cancel scale-out demands and request for scale-in demand.
         if queue_size > 0:
-            if not self.scale_out_demanded:
-                print(f"Scale-out demanded for queue_size={queue_size}")
-                self.scale_out_demanded = True
-                self.scaling_demanded_at = now
-        elif self.scaling_demanded_at is None:
-            # It's time to attempte idle worker removal.
-            self.scale_out_demanded = False
-            self.scaling_demanded_at = now
+            if self._scale_out_after is None and self._scale_out_cool_down_before < now:
+                self._scale_out_after = now + datetime.timedelta(seconds=self.wait_scale_out)
+            self._scale_in_after = None
+        else:
+            if self._scale_in_after is None:
+                self._scale_in_after = now + datetime.timedelta(seconds=self.wait_scale_in)
+            self._scale_out_after = None
 
-        # After wait_period, attempt the scaling action.
-        scale_worker_num = 0
-        if self.scaling_demanded_at is not None \
-            and (now - self.scaling_demanded_at).total_seconds() >= self.wait_period:
-            if self.scale_out_demanded:
-                scale_worker_num = 1
-            else:
-                scale_worker_num = -1
-
-            # Attempt has been made, reset scaling_demanded_at.
-            self.scaling_demanded_at = None
-
-            print(f"Scaling attempt: {scale_worker_num}/{worker_pool_size}")
-
-        if scale_worker_num > 0:
-            self.scale_out(scale_worker_num)
-
-        if scale_worker_num < 0:
-            self.scale_in(-scale_worker_num)
+        # Evaluate wait period, attempt the scaling action if it elapsed.
+        # Always evaluate scale-out with higher priority.
+        if self._scale_out_after is not None:
+            if self._scale_out_after < now:
+                self.scale_out(1)
+                self._scale_out_after = None
+                self._scale_out_cool_down_before = datetime.datetime.now() + \
+                    datetime.timedelta(seconds=self.scale_out_cool_down)
+        elif self._scale_in_after is not None and self._scale_in_after < now:
+            self.scale_in(1)
+            self._scale_in_after = None
 
 
     def scale_out(self, count):
@@ -262,14 +256,13 @@ class AutoScaler:
         template = self._sandbox_template()
         workers_in_template = _workers_in_template(template)
 
-        desired_num = len(workers_in_template) + count
-        if desired_num > self.max_workers:
-            desired_num = self.max_workers
+        desired_num = min(len(workers_in_template) + count, self.max_workers)
         count = desired_num - len(workers_in_template)
         if count <= 0:
             return
         for _ in range(0, count):
             self._add_worker_to_template(template)
+        logging.info("Add %d workers", count)
         _cs_sandbox(["edit", "--force", "--from", "-"], input=json.dumps(template))
 
 
@@ -297,10 +290,12 @@ class AutoScaler:
         if len(idle_workers) == 0:
             return
 
+        idle_workers.reverse()
         idle_worker_names = {x: True for x in idle_workers[:count]}
         template["containers"] = list(filter(
             lambda container : container["name"] not in idle_worker_names,
             template["containers"]))
+        logging.info("Remove idle workers: %s", ','.join(idle_worker_names.keys()))
         _cs_sandbox(["edit", "--force", "--from", "-"], input=json.dumps(template))
 
 
@@ -319,8 +314,9 @@ class AutoScaler:
 
 
     def _sandbox_template(self):
-        return json.loads(_cs_sandbox(["show", self._sandbox_name, "--def"], capture_output=True))
+        return json.loads(_cs_sandbox(["show", self.sandbox_name, "--def"], capture_output=True))
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
     AutoScaler().monitor_loop()
