@@ -1,266 +1,111 @@
 #!/usr/bin/python3
 
+"""
+Buildfarm auto-scaling reference implementation.
+
+This is a reference implementation for adding/removing buildfarm
+workers from the sandbox based on the queue-length.
+This script must run from inside a sandbox that's defined for running
+the buildfarm.
+The sandbox will not be linked to any template once it's updated.
+"""
+
 import time
-import sys
 import os
 import subprocess
 import json
 import datetime
-import functools
-import requests
 import io
+import urllib.request
+import logging
+import traceback
 
-# How often to scrape metrics and try to scale. Could config by setting environment variable BF_SCRAPE_INTERVAL=xxx
-scrape_interval=5 
-# When an error occurs, the delay of retrying. Unit is sceond.
-delay_of_retry=1
-# Start to scale up/down when the trend of scaliing up/down  has lasted for the period of time. Unit is second
-trending_duration = 10
-# Minimal number of buildfarm worker. Could config by setting environment variable BF_MIN_WORKER=xxx. The value must greater than 0
-min_worker = 1
-# Maximal number fo buildfarm worker. Could config by setting environment variable BF_MAX_WORKER=xxx. The value muster greater equal than min_worker
-max_worker = 4
 
-bf_server_metrics_url="http://bf-server:9090/metrics"
+def _fetch_url(url: str) -> str:
+    """Returns the payload from an HTTP GET request."""
+    with urllib.request.urlopen(url) as reply:
+        return reply.read().decode('utf-8')
 
-# A class to store global infromation.
-class Global:
-    sandbox_name = ""
-    expected_worker_num = 1
-    is_scale_up_trending = True
-    trending_start_time = datetime.datetime.now()
+
+def _cs_sandbox(args: list[str], **kwargs):
+    """A helper to invoke the CLI."""
+    result = subprocess.run(["cs", "-o", "json", "sandbox"] + args, text=True,check=True,**kwargs)
+    if result.returncode != 0:
+        raise CLIError(result.returncode, result.stderr)
+    return result.stdout
+
+
+def _workers_in_template(template):
+    """
+    Extract the list of worker containers from the template.
+
+    The worker containers are named "bf-worker-N" where N is from [0, max_workers).
+    """
+    return list(filter(
+        lambda container: container["name"].startswith("bf-worker-"),
+        template["containers"]))
+
+
+class CLIError(Exception):
+    """Failed to execute CLI command."""
+
+    def __init__(self, exit_code: int, stderr: str):
+        Exception.__init__(self, f'CLI exited {exit_code}: {stderr}')
+        self.exit_code = exit_code
+        self.stderr = stderr
+
+
+class ParameterError(Exception):
+    """Invalid parameter in configuration."""
+
+    def __init__(self, reason: str):
+        Exception.__init__(self, f'Invalid config: {reason}')
+
+
+class ValuesByKey:
+    """
+    The metric values by key.
+    The value mapping to a key is a list of floating numbers
+    from the metrics named by the key.
+    """
+
     def __init__(self):
-        self.sandbox_name = os.getenv("SANDBOX_NAME")
-        if self.sandbox_name == "" or self.sandbox_name == None:
-            print('Failed to get sandbox name', file=sys.stderr)
-            sys.exit(1)
+        self.values_by_key = {}
+
+    def add(self, key: str, value: float):
+        """Add a new value."""
+        values = self.values_by_key.get(key, [])
+        values.append(value)
+        self.values_by_key[key] = values
 
 
-# Metrics scraped from buldfarm server
-class BuildfarmServerMetrics:
-    queue_size = 0
-    worker_pool_size = 0 
-
-# Metrics scraped from buildfarm worker
-class BuildfarmWorkerMetrics:
-    worker_name = ""
-    execution_slot_usage = 0
+    def sum(self, key: str) -> float:
+        """Sum up all the values of the specified key."""
+        return sum(self.values_by_key.get(key, []))
 
 
-def main():
-    load_config()
-    log("scrape_interval: {}".format(scrape_interval))
-    log("delay_of_retry: {}".format(delay_of_retry))
-    log("trending_duration: {}".format(trending_duration))
-    log("min_worker: {}".format(min_worker))
-    log("max_worker: {}".format(max_worker))
-    g = Global()
+def scrape_metrics_from(server_url: str) -> ValuesByKey:
+    """
+    Scrape and prometheus metrics by key.
 
-    while True:
-        err = scale(g)
-        if err != None:
-            log_error(str(err))
-            time.sleep(delay_of_retry)
-            continue
-        time.sleep(scrape_interval)
-    return
+    The scraped prometheus metrics are lines of:
+    key{label1=value, label2=value...} VALUE
+    ...
 
-def load_config():
-    global min_worker
-    global max_worker
-    global scrape_interval
-    global delay_of_retry
-    global trending_duration
+    The values from the same key are appended to the same list
+    with labels discarded.
 
-    min_worker = load_env_or_default("BF_MIN_WORKER",min_worker)
-    if min_worker < 1:
-        min_worker = 1
-    
-    max_worker = load_env_or_default("BF_MAX_WORKER",max_worker)
-    if max_worker < min_worker:
-        max_worker = min_worker
-    
-    scrape_interval= load_env_or_default("BF_SCRAPE_INTERVAL",scrape_interval)
-    if scrape_interval <=0:
-        scrape_interval = 1
-    
-    delay_of_retry = load_env_or_default("BF_SCALE_DELAY_OF_RETRY",delay_of_retry)
-    if delay_of_retry < 0:
-        delay_of_retry = 0
-    
-    trending_duration = load_env_or_default("BF_SCALE_TRENDING_DURATION",trending_duration)
+    For example, the original metrics are:
+    pool_size{pool="pool1"} 5
+    pool_size{pool="pool2"} 3
 
-def load_env_or_default(key,default):
-    v = os.getenv(key)
-    if v == None:
-        return default
-    return int(v)
-    
-
-
-def scale(g):
-    server_metrics,err = scrape_buildfarm_server_metrics()
-    if err != None:
-        log_error("failed to scrape buildfarm server metrics: " + str(err))
-        return False
-    now = datetime.datetime.now()
-    log("{} , queue size is {}".format(now,server_metrics.queue_size))
-    # Update scale trending. 
-    # If actions queue size greater than 0, update the scale trending to scale up trending(add worker). 
-    # Otherwise, update the scale trending to scale down trending(remove worker).
-    if server_metrics.queue_size > 0:
-        if not g.is_scale_up_trending:
-            log("queue_szie is {}, switched to scale up trending".format(server_metrics.queue_size))
-            g.is_scale_up_trending = True
-            g.trending_start_time = now
-    else:
-        if g.is_scale_up_trending:
-            log("queue_szie is 0, switched to scale down trending")
-            g.is_scale_up_trending = False
-            g.trending_start_time = now
-    
-    # Update expected worker number when the trend has lasted for a certain period of time
-    if (now - g.trending_start_time).total_seconds() >= trending_duration:
-        # The server_metrics.worker_pool_size is the number of worker that has connected to the buildfarm server
-        # Only scale up/down when the previous scaled worker has really connected to buildfarm server.
-        if g.is_scale_up_trending and g.expected_worker_num <= server_metrics.worker_pool_size:
-            g.expected_worker_num += 1
-        if not g.is_scale_up_trending and g.expected_worker_num >= server_metrics.worker_pool_size:
-            g.expected_worker_num -= 1
-
-        # Limit min and max worker.
-        if g.expected_worker_num > max_worker:
-            g.expected_worker_num = max_worker
-        if g.expected_worker_num <  min_worker:
-            g.expected_worker_num = min_worker
-
-    if g.expected_worker_num > server_metrics.worker_pool_size:
-        return scale_up(g,server_metrics)
-
-    if g.expected_worker_num < server_metrics.worker_pool_size:
-        return scale_down(g, server_metrics)
-
-    return None
-
-
-# Scale up the worker by updating the sandbox definition.
-def scale_up(g,server_metrics):
-    template,err = sandbox_template(g)
-    if err != None:
-        return err
-    workers_in_template = workers_defined_in_template(template)
-    scale_num = g.expected_worker_num - len(workers_in_template)  
-    if scale_num <=  0:
-        return
-    log("scaling up to {} workers, need to add {} worker".format(g.expected_worker_num, scale_num))
-    for i in range(0,scale_num):
-        alloc_worker_to_template(template)
-    log("updating sandbox")
-    result = subprocess.run(["cs","sandbox","edit","--force","--from","-"],input=json.dumps(template),text=True,stdout=subprocess.DEVNULL)
-    if result.returncode != 0:
-        log_error("failed to scale up worker: {}".format(result.stderr))
-        return result.stderr
-    log("scaled worker num to {}".format(g.expected_worker_num))
-    return None
-
-
-# Scale down the workers by updating the sandbox definition.
-def scale_down(g,server_metrics):
-    template,err = sandbox_template(g)
-    if err != None:
-        return log_error(err)
-    workers_in_template = workers_defined_in_template(template)
-
-    scale_num =  len(workers_in_template)  - g.expected_worker_num 
-    if scale_num <= 0:
-        return
-
-    log("scaling down to {} workers, need to remove {} worker".format(g.expected_worker_num, scale_num))
-    
-    metrics =[]
-    has_idled_worker = False
-    for i in range(0,scale_num):
-        for worker in workers_in_template:
-            worker_metric,err = scrape_buildfarm_worker_metrics(worker["name"])
-            if err == None:
-                metrics.append(worker_metric)
-        idle_workers =list(filter(lambda x: x.execution_slot_usage ==0, metrics))
-        if len(idle_workers) == 0:
-            continue
-        has_idled_worker = True
-        template["containers"] = list(filter(lambda container : container["name"] != idle_workers[0].worker_name,template["containers"] ))
-    if not has_idled_worker:
-        log("All workers are busy, do not remove now")
-        return None
-    log("updating sandbox")
-    result = subprocess.run(["cs","sandbox","edit","--force","--from","-"],input=json.dumps(template),text=True, stdout=subprocess.DEVNULL)
-    if result.returncode != 0:
-        log_error("failed to scale down worker: {}".result.stderr)
-        return result.stderr
-    log("scaled down worker to {}".format(len(workers_defined_in_template(template))))
-    return None
-
-# Get sandbox definition
-def sandbox_template(g):
-    result = subprocess.run(["cs","sandbox","show",g.sandbox_name,"-d","-o","json"],capture_output=True, text=True)
-    if result.returncode != 0 :
-        return None,result.stderr
-    data,err = parse_json(result.stdout)
-    return data,err
- 
-
-# Get buildfarm-workers containers in sandbox definition
-def workers_defined_in_template(template):
-    return list(filter(lambda container: container["name"].startswith("bf-worker"), template["containers"]))
-
-# Add one buildfarm-worker container to definition
-def alloc_worker_to_template(template):
-    workers = workers_defined_in_template(template)
-    for ii in range (0,max_worker):
-        worker_name = "bf-worker"+str(ii)
-        if not has_bf_worker(workers,worker_name):
-            worker = workers[0].copy()
-            worker["name"] = worker_name
-            template["containers"].append(worker)
-            return
-
-
-def has_bf_worker(workers,name):
-    for worker in workers:
-        if worker["name"] == name:
-            return True
-
-    return False
-
-
-# Scrape the metrics of buildfarm server.
-def scrape_buildfarm_server_metrics():
-    server_metrics = BuildfarmServerMetrics()
-    try:
-        response = requests.get(bf_server_metrics_url)
-        response.close()
-        if response.status_code != 200:
-            return None,response.text
-    except Exception as error:
-        return None,err
-    metrics = parse_metrics(response.text)
-    queue_size_key="queue_size"
-    worker_pool_size_key = "worker_pool_size"
-
-    if not queue_size_key in metrics:
-        return None, "metric {} not found".format(queue_size_key)
-    queue_size = 0
-    for k,v in metrics[queue_size_key].items():
-        server_metrics.queue_size += int(float(v))
-    if not worker_pool_size_key in metrics:
-        return None, "metric {} not found".format(worker_pool_size_key)
-
-    server_metrics.worker_pool_size = int(float(metrics[worker_pool_size_key]))
-    return server_metrics,None
-
-def parse_metrics(content):
-    buf = io.StringIO(content)
-    metrics = {}
+    The returned ValuesByKey contains:
+    {
+        "pool_size": [5, 3]
+    }
+    """
+    buf = io.StringIO(_fetch_url(server_url))
+    values_by_key = ValuesByKey()
     while True:
         line = buf.readline()
         if len(line) == 0:
@@ -271,80 +116,207 @@ def parse_metrics(content):
         line = line.strip()
         try:
             index = line.rindex(" ")
-        except Exception as error:
+        except ValueError:
             continue
         key = line[:index]
         value = line[index+1:]
         try:
             label_index = key.index("{")
-        except Exception as error:
-            metrics[key] = value
-            continue
-        label = key[label_index:]
-        group=key[:label_index]
-        if group in metrics:
-            metrics[group][label] = value
+            key = key[:label_index]
+        except ValueError:
+            # Ignore the exception.
+            pass
+        values_by_key.add(key, float(value))
+    return values_by_key
+
+
+class AutoScaler:
+    """
+    The auto-scale controller of the buildfarm workers.
+
+    The "queue_size" metric from the server is used to decide whether additional
+    workers are needed. When queue_size is positive, it's the time to add workers.
+    When it's zero, attempts are made to remove idle workers.
+
+    For avoid overrunning and keep the action stable, a "wait_period" is introduced.
+    When the scaling condition is detected, "scaling_demanded_at" is set to a valid
+    time as a starting point. After time elapsed by "wait_period", and the scaling
+    condition still stand, the scaling action will be attempted.
+
+    The min/max numbers of workers are always required. And the min_workers must not
+    be smaller than 1.
+    """
+
+
+    # pylint: disable=too-many-instance-attributes
+    # These are parameters for auto-scaling.
+
+    def __init__(self):
+        self.sandbox_name = os.environ.get("SANDBOX_FULL_NAME", "")
+        if self.sandbox_name == "":
+            raise ParameterError("sandbox name unknown")
+
+        self.server_url = os.environ.get("BF_SERVER_URL", "http://bf-server:9090/metrics")
+
+        # Following are the parameters for auto-scaling.
+
+        # The minimum number of workers.
+        self.min_workers = int(os.environ.get("BF_MIN_WORKERS", "1"))
+        if self.min_workers < 1:
+            raise ParameterError(f"min_workers {self.min_workers} < 1")
+
+        # The maximum number of workers.
+        self.max_workers = int(os.environ.get("BF_MAX_WORKERS", "4"))
+        if self.max_workers < self.min_workers:
+            raise ParameterError(f"max_workers {self.max_workers} < min_workers {self.min_workers}")
+
+        # The seconds to wait before taking the action since scale-out is demanded.
+        # This value can be relatively small for more aggresive scale-out.
+        self.wait_scale_out = int(os.environ.get("BF_WAIT_SCALE_OUT", "5"))
+
+        # The seconds to wait before taking the action since scale-in is demanded.
+        # This value can be relatively large for less aggresive scale-in.
+        self.wait_scale_in = int(os.environ.get("BF_WAIT_SCALE_IN", "60"))
+
+        # The seconds to cool-down before next scale-out can happen.
+        self.scale_out_cool_down = int(os.environ.get("BF_SCALE_OUT_COOL_DOWN", "60"))
+
+        # The seconds between scrapes of the metrics.
+        self.scrape_interval = int(os.environ.get("BF_SCRAPE_INTERVAL", "5"))
+
+        # The seconds of delay before next retry.
+        self.retry_delay = int(os.environ.get("BF_RETRY_DELAY", "1"))
+
+        # Following are the states for controling the scaling.
+
+        # If scale-out/in is demanded.
+        # This is the time with wait and cool-down taken into consideration.
+        # The actual scaling should not happen before this time.
+        self._scale_out_after: datetime.datetime | None = None
+        self._scale_in_after: datetime.datetime | None = None
+
+        # The scale-out cool-down time.
+        # Scale-out should NOT be demanded before this time.
+        self._scale_out_cool_down_before = datetime.datetime.now()
+
+
+    def monitor_loop(self):
+        """The loop to scrape metrics and perform auto-scaling."""
+        while True:
+            try:
+                self.scrape_and_scale()
+                time.sleep(self.scrape_interval)
+            except Exception as error: # pylint: disable=broad-except
+                traceback.print_exception(error)
+                time.sleep(self.retry_delay)
+
+
+    def scrape_and_scale(self):
+        """Scrape the metrics and perform auto-scaling if needed."""
+
+        server_metrics = scrape_metrics_from(self.server_url)
+        queue_size = server_metrics.sum("queue_size")
+
+        now = datetime.datetime.now()
+
+        logging.debug("Scrape queue_size=%d", queue_size)
+
+        # When scale-out/in is demanded, wait period is activated.
+        # After the wait_period elapsed, scaling action will be attempted.
+
+        # Calculate scaling demand:
+        # - demand scale-out if queue_size is greater than 0.
+        # - otherwise, always cancel scale-out demands and request for scale-in demand.
+        if queue_size > 0:
+            if self._scale_out_after is None and self._scale_out_cool_down_before < now:
+                self._scale_out_after = now + datetime.timedelta(seconds=self.wait_scale_out)
+            self._scale_in_after = None
         else:
-            metrics[group]={label:value}
-    return metrics
+            if self._scale_in_after is None:
+                self._scale_in_after = now + datetime.timedelta(seconds=self.wait_scale_in)
+            self._scale_out_after = None
+
+        # Evaluate wait period, attempt the scaling action if it elapsed.
+        # Always evaluate scale-out with higher priority.
+        if self._scale_out_after is not None:
+            if self._scale_out_after < now:
+                self.scale_out(1)
+                self._scale_out_after = None
+                self._scale_out_cool_down_before = datetime.datetime.now() + \
+                    datetime.timedelta(seconds=self.scale_out_cool_down)
+        elif self._scale_in_after is not None and self._scale_in_after < now:
+            self.scale_in(1)
+            self._scale_in_after = None
 
 
-# Scrape the metrics of a buildfarm worker.
-def scrape_buildfarm_worker_metrics(worker_name):
-    url = "http://{}:9090/metric".format(worker_name)
-    worker_metrics = BuildfarmWorkerMetrics() 
-    worker_metrics.worker_name = worker_name
+    def scale_out(self, count):
+        """Scale out by adding the specified number of workers."""
 
-    result = subprocess.run(["prom2json",url],capture_output=True, text=True)
-    try:
-        response = requests.get(url)
-        response.close()
-        if response.status_code != 200:
-            return None,response.text
-    except Exception as error:
-        return None,err
+        # Retrieve the current definition of the sandbox and extract the workers.
+        template = self._sandbox_template()
+        workers_in_template = _workers_in_template(template)
 
-    metrics = parse_metrics(response.text)
-    slot_usage_key = "execution_slot_usage"
-    if not slot_usage_key in metrics:
-        return None, "metrics {} not found".format(slot_usage_key)
-    worker_metrics.execution_slot_usage = int(float(metric[slot_usage_key]))
+        desired_num = min(len(workers_in_template) + count, self.max_workers)
+        count = desired_num - len(workers_in_template)
+        if count <= 0:
+            return
+        for _ in range(0, count):
+            self._add_worker_to_template(template)
+        logging.info("Add %d workers", count)
+        _cs_sandbox(["edit", "--force", "--from", "-"], input=json.dumps(template))
 
 
-    if result.returncode != 0 :
-        return None,result.stderr
-    data,err = parse_json(result.stdout)
-    if err != None:
-        return None,err
-    metrics.execution_slot_usage= functools.reduce(
-        lambda a,b: a+b,
-        map(
-            lambda metric: functools.reduce(lambda a,b:a+b,map(lambda x: int(x["value"]),metric["metrics"])),
-            filter(lambda obj: obj["name"] == "execution_slot_usage", data),
-        ),
-    )
-    return metrics,None
+    def scale_in(self, count):
+        """Scale in by removing the specified number of workers."""
 
-def log_error(msg):
-    if isinstance(msg, str):
-        print("Error: " + msg, file=sys.stderr)
-    else:
-        print("Error: " + str(msg), file=sys.stderr)
+        # Retrieve the current definition of the sandbox and extract the workers.
+        template = self._sandbox_template()
+        workers_in_template = _workers_in_template(template)
 
-def log(msg):
-    print(msg)
+        desired_num = len(workers_in_template) - count
+        if desired_num < self.min_workers:
+            desired_num = self.min_workers
+        count = len(workers_in_template) - desired_num
+        if count <= 0:
+            return
 
-def fatal(msg):
-    log_error(msg)
-    sys.exit(1)
+        # Find all idle workers.
+        idle_workers = []
+        for worker in workers_in_template:
+            values = scrape_metrics_from(f"http://{worker['name']}:9090/metric")
+            if values.sum("execution_slot_usage") == 0:
+                idle_workers.append(worker["name"])
 
-def parse_json(json_string):
-    try:
-        data = json.loads(json_string)
-        return data,None
-    except Exception as error:
-        return None,error
+        if len(idle_workers) == 0:
+            return
+
+        idle_workers.reverse()
+        idle_worker_names = {x: True for x in idle_workers[:count]}
+        template["containers"] = list(filter(
+            lambda container : container["name"] not in idle_worker_names,
+            template["containers"]))
+        logging.info("Remove idle workers: %s", ','.join(idle_worker_names.keys()))
+        _cs_sandbox(["edit", "--force", "--from", "-"], input=json.dumps(template))
+
+
+    def _add_worker_to_template(self, template):
+        workers = _workers_in_template(template)
+        worker_by_names = {x["name"]: x for x in workers}
+        # Workers are named as "bf-worker-N" where N is from [0..max_workers).
+        for i in range(0, self.max_workers):
+            worker_name = "bf-worker-"+str(i)
+            if worker_name not in worker_by_names:
+                # Worker containers share the same definition, copy the first one.
+                worker = workers[0].copy()
+                worker["name"] = worker_name
+                template["containers"].append(worker)
+                return
+
+
+    def _sandbox_template(self):
+        return json.loads(_cs_sandbox(["show", self.sandbox_name, "--def"], capture_output=True))
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
+    AutoScaler().monitor_loop()
